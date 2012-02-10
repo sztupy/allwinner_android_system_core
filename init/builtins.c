@@ -41,6 +41,9 @@
 
 #include <private/android_filesystem_config.h>
 
+#include <sys/reboot.h>
+#include <sys/wait.h>
+
 void add_environment(const char *name, const char *value);
 
 extern int init_module(void *, unsigned long, const char *);
@@ -167,9 +170,42 @@ int do_domainname(int nargs, char **args)
     return write_file("/proc/sys/kernel/domainname", args[1]);
 }
 
+/*exec <path> <arg1> <arg2> ... */
+#define MAX_PARAMETERS 64
 int do_exec(int nargs, char **args)
 {
-    return -1;
+    pid_t pid;
+    int status, i, j;
+    char *par[MAX_PARAMETERS];
+    if (nargs > MAX_PARAMETERS)
+    {
+        return -1;
+    }
+    for(i=0, j=1; i<(nargs-1) ;i++,j++)
+    {
+        par[i] = args[j];
+    }
+    par[i] = (char*)0;
+    pid = fork();
+    if (!pid)
+    {
+        char tmp[32];
+        int fd, sz;
+        get_property_workspace(&fd, &sz);
+        sprintf(tmp, "%d,%d", dup(fd), sz);
+        setenv("ANDROID_PROPERTY_WORKSPACE", tmp, 1);
+        execve(par[0],par,environ);
+        exit(0);
+    }
+    else
+    {
+        waitpid(pid, &status, 0);
+        if (WEXITSTATUS(status) != 0) {
+            ERROR("exec: pid %1d exited with return code %d: %s", (int)pid, WEXITSTATUS(status), strerror(status));
+        }
+        
+    }
+    return 0;
 }
 
 int do_export(int nargs, char **args)
@@ -279,7 +315,8 @@ int do_mount(int nargs, char **args)
     unsigned flags = 0;
     int n, i;
     int wait = 0;
-
+	
+	ERROR(" do_mount \n");
     for (n = 4; n < nargs; n++) {
         for (i = 0; mount_flags[i].name; i++) {
             if (!strcmp(args[n], mount_flags[i].name)) {
@@ -365,6 +402,17 @@ int do_mount(int nargs, char **args)
 
         return 0;
     }
+}
+
+int do_umount(int nargs, char **args)
+{
+	ERROR("do_umount: %s \n", args[1]);
+	if(-1 == umount(args[1]) )
+	{
+		ERROR("do_umount error = %s", strerror(errno));
+		return -1;
+	} 
+	return 0;
 }
 
 int do_setkey(int nargs, char **args)
@@ -565,3 +613,116 @@ int do_wait(int nargs, char **args)
     }
     return -1;
 }
+
+/* setupfs, format a device to ext4 */
+const char *mkfs = "/system/bin/make_ext4fs";
+
+int setup_fs(const char *blockdev)
+{
+    char buf[256], path[128];
+    pid_t child;
+    int status, n;
+
+	/* we might be looking at an indirect reference */
+    n = readlink(blockdev, path, sizeof(path) - 1);	
+	//weng: fix the readlink error!
+	if (n < 0) {
+		fprintf(stderr, "readlink err: %d\n", errno);
+		n = strlen(blockdev);	
+		strcpy(path, blockdev);
+	}
+	//weng: ====
+    if (n > 0) {
+        path[n] = 0;
+        if (!memcmp(path, "/dev/block/", 11))
+            blockdev = path + 11;
+    }
+	
+
+    if (strchr(blockdev,'/')) {
+        fprintf(stderr,"not a block device name: %s\n", blockdev);
+        return 0;
+    }
+    
+    sprintf(buf,"/sys/fs/ext4/%s", blockdev);
+    if (access(buf, F_OK) == 0) {
+        fprintf(stderr,"device %s already has a filesystem\n", blockdev);
+        return 0;
+    }
+    sprintf(buf,"/dev/block/%s", blockdev);
+
+    fprintf(stderr,"+++\n");
+    
+tryagain:
+	ERROR("buffer : %s", buf);
+    child = fork();
+    if (child < 0) {
+        fprintf(stderr,"error: fork failed\n");
+        return 0;
+    }
+    if (child == 0) {
+        execl(mkfs, mkfs, buf, NULL);        
+    }else{    	
+		waitpid(child, &status, 0);
+		if (WEXITSTATUS(status) != 0) {
+			ERROR("exec: pid %1d exited with return code %d: %s", (int)child, WEXITSTATUS(status), strerror(status));
+			sleep(3);
+			goto tryagain;
+		}
+    }
+	
+    //while (waitpid(-1, &status, 0) != child) ;
+
+    return 1;
+}
+
+
+int do_setupfs(int argc, char **argv)
+{
+    int need_reboot = 0;
+
+	fprintf(stderr, "setup_fs v0.1\n");
+
+	return setup_fs(argv[1]);
+}
+
+int do_format_userdata(int argc, char **argv)
+{	
+	const char *devicePath = "/dev/block/nandh";	
+	char bootsector[512];
+	char lable[32];
+	int fd;
+	int num;
+	pid_t child;
+	int status;
+	
+	fd = open(devicePath, O_RDONLY);
+	if( fd <= 0 ) {
+		ERROR("open device error :%s", strerror(errno));	
+		return 1;
+	}
+	memset(bootsector, 0, 512);
+	read(fd, bootsector, 512);
+	close(fd);
+	if( (bootsector[510]==0x55) && (bootsector[511]==0xaa) ) 
+	{	
+		ERROR("dont need format /dev/block/nandh");	
+		return 1;
+	}
+	else // 格式化
+	{
+		ERROR("start format /dev/block/nandh");
+		child = fork();		
+    	if (child == 0) {
+    		ERROR("fork to format /dev/block/nandh");
+        	execl("/system/bin/logwrapper","/system/bin/logwrapper","/system/bin/newfs_msdos","-F","32","-O","android","-c","8", "-L",argv[1],devicePath, NULL);
+        	exit(-1);
+   		}
+   		ERROR("wait for format /dev/block/nandh");
+   		while (waitpid(-1, &status, 0) != child) ;
+   		ERROR("format /dev/block/nandh ok");
+   		return 1;
+	}  
+}
+
+
